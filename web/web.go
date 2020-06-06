@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/hashicorp/raft"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -11,8 +12,13 @@ import (
 	"time"
 )
 
+type peer struct {
+	Raft string `json:raft`
+	Http string `json:http`
+}
+
 type clusterConfig struct {
-	Peers   []string `json:peers`
+	Peers   []peer `json:peers`
 	Dir 	string `json:dir`
 }
 
@@ -67,8 +73,8 @@ func (s *Server) Start() error {
 	var servers []raft.Server
 	for _, peer := range s.config.Peers {
 		servers = append(servers, raft.Server{
-			ID:       raft.ServerID(peer),
-			Address:  raft.ServerAddress(peer),
+			ID:       raft.ServerID(peer.Raft),
+			Address:  raft.ServerAddress(peer.Raft),
 		})
 	}
 	s.raft.BootstrapCluster(raft.Configuration{Servers: servers})
@@ -121,6 +127,11 @@ func (s *Server) GetRequest(writer http.ResponseWriter, request *http.Request) {
 	request.ParseForm()
 	key := request.Form.Get("key")
 
+	if s.raft.State() != raft.Leader {
+		s.forwardToLeader(writer, request)
+		return
+	}
+
 	command := &Command{
 		Op:    "get",
 		Key:   key,
@@ -150,9 +161,10 @@ func (s *Server) SetRequest(writer http.ResponseWriter, request *http.Request) {
 	key := request.Form.Get("key")
 	value := request.Form.Get("value")
 
-	/*if s.raft.State() != raft.Leader {
-		s.raft.
-	}*/
+	if s.raft.State() != raft.Leader {
+		s.forwardToLeader(writer, request)
+		return
+	}
 	
 	command := &Command{
 		Op:    "set",
@@ -176,4 +188,32 @@ func (s *Server) SetRequest(writer http.ResponseWriter, request *http.Request) {
 
 	writer.WriteHeader(200)
 	fmt.Fprintf(writer, "[key = %s, value = %s]", key, value)
+}
+
+func (s *Server) forwardToLeader(writer http.ResponseWriter, request *http.Request)  {
+	var url string
+	for _, peer := range s.config.Peers {
+		if raft.ServerAddress(peer.Raft) == s.raft.Leader() {
+			url = peer.Http
+		}
+	}
+
+	if len(url) == 0 {
+		writer.WriteHeader(500)
+		fmt.Fprint(writer, "leader not found")
+		return
+	}
+
+	url = url + request.RequestURI
+	fmt.Printf("forwarding request from %s to %s\n", s.bind, url)
+
+	res, err := http.Get(url)
+	if err != nil {
+		writer.WriteHeader(500)
+		fmt.Fprintf(writer, "error forward: %v", err)
+		return
+	}
+
+	defer res.Body.Close()
+	io.Copy(writer, res.Body)
 }
